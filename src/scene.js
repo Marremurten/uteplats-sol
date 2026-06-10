@@ -49,6 +49,9 @@ export function createScene(canvas, data) {
     left: -half, right: half, top: half, bottom: -half, near: 10, far: 1600,
   })
   sunLight.shadow.bias = -0.0004
+  // Utan normalBias blir flacka, lätt ojämna tak spräckliga av
+  // självskuggningsbrus när solen står lågt.
+  sunLight.shadow.normalBias = 1.2
   scene.add(sunLight, sunLight.target)
 
   const hemi = new THREE.HemisphereLight(0xbdd4ee, 0x3a3a33, 0.75)
@@ -396,21 +399,48 @@ function makeLaserBuilding(b, terrain, mats) {
   // Rå yta innan filtret — spikarna som filtreras bort är skorstenarna.
   const rawInside = new Map(inside)
 
-  // 3×3-medianfilter på takytan: tar bort skorstenar/antenner (punktspikar)
-  // men bevarar nockar, som har stöd längs hela sin längd.
-  const smoothed = new Map()
-  for (const key of inside.keys()) {
-    const [e, n] = key.split(',').map(Number)
-    const neigh = []
-    for (let dn = -1; dn <= 1; dn++) {
-      for (let de = -1; de <= 1; de++) {
-        const v = inside.get(`${e + de},${n + dn}`)
-        if (v !== undefined) neigh.push(v)
+  // Takytan jämnas i tre pass: 2× 3×3-median (tar punktspikar —
+  // skorstenar/antenner — men bevarar nockar, som har stöd längs hela sin
+  // längd) och därefter ett medelvärdespass begränsat till ±0,35 m, som
+  // tar laserbrusets småbucklor utan att äta upp nock- och takkupskanter.
+  const medianPass = (src) => {
+    const out = new Map()
+    for (const key of src.keys()) {
+      const [e, n] = key.split(',').map(Number)
+      const neigh = []
+      for (let dn = -1; dn <= 1; dn++) {
+        for (let de = -1; de <= 1; de++) {
+          const v = src.get(`${e + de},${n + dn}`)
+          if (v !== undefined) neigh.push(v)
+        }
       }
+      neigh.sort((a, c) => a - c)
+      out.set(key, neigh[Math.floor(neigh.length / 2)])
     }
-    neigh.sort((a, c) => a - c)
-    smoothed.set(key, neigh[Math.floor(neigh.length / 2)])
+    return out
   }
+  const cappedMeanPass = (src, cap) => {
+    const out = new Map()
+    for (const key of src.keys()) {
+      const [e, n] = key.split(',').map(Number)
+      let sum = 0
+      let count = 0
+      for (let dn = -1; dn <= 1; dn++) {
+        for (let de = -1; de <= 1; de++) {
+          const v = src.get(`${e + de},${n + dn}`)
+          if (v !== undefined) {
+            sum += v
+            count++
+          }
+        }
+      }
+      const v0 = src.get(key)
+      const mean = sum / count
+      out.set(key, v0 + Math.max(-cap, Math.min(cap, mean - v0)))
+    }
+    return out
+  }
+  const smoothed = cappedMeanPass(medianPass(medianPass(inside)), 0.35)
   for (const [key, v] of smoothed) inside.set(key, v)
 
   // Takfot: p15 av laserytan — men bara av celler som faktiskt ligger uppe
@@ -668,7 +698,7 @@ const TREE_AUTUMN = 0xb3893e
  * mellan körningar. Träden ingår inte i sol-occludern (medvetet).
  */
 function makeTreesGroup(terrain) {
-  const trees = detectTrees({
+  const detected = detectTrees({
     classGrid: terrain.classGrid,
     grid: terrain.canopyGrid,
     groundGrid: terrain.groundGrid,
@@ -677,6 +707,30 @@ function makeTreesGroup(terrain) {
   })
   const z0 = terrain.originElevation
 
+  // Gallring: encellsfynd är oftast laserbrus (balkonger, takutsprång) —
+  // bort. Träd alldeles intill en husfasad är mest felklassade utsprång;
+  // släpp bara igenom någon enstaka.
+  const size = terrain.gridSize
+  const half = terrain.areaSize / 2
+  const nearBuilding = (t) => {
+    const col = Math.round(t.e + half)
+    const row = Math.round(half - t.n)
+    for (let dr = -3; dr <= 3; dr++) {
+      for (let dc = -3; dc <= 3; dc++) {
+        const c = col + dc
+        const r = row + dr
+        if (c < 0 || r < 0 || c >= size || r >= size) continue
+        if (terrain.classGrid[r * size + c] === 2) return true
+      }
+    }
+    return false
+  }
+  const trees = detected.filter((t) => {
+    if (t.radius < 1.3) return false
+    if (nearBuilding(t)) return hashId(`${t.e},${t.n}`) % 6 === 0
+    return true
+  })
+
   // Sortera instanserna per krontyp så att varje InstancedMesh får exakt
   // sina träd.
   const byType = CROWN_TYPES.map(() => [])
@@ -684,19 +738,16 @@ function makeTreesGroup(terrain) {
     const h = hashId(`${t.e},${t.n}`)
     const r01 = (n) => ((h >>> n) & 0xff) / 255
     const type = h % 10 <= 5 ? 0 : h % 10 <= 8 ? 1 : 2
-    const height = (t.top - t.ground) * (0.92 + 0.16 * r01(3))
+    // Nedskalad mot lasern och kapad — träden ska inte dominera husen.
+    const height = Math.min((t.top - t.ground) * (0.78 + 0.14 * r01(3)), 13)
     const trunkH = height * (type === 2 ? 0.2 : 0.35)
     const crownH = height - trunkH
     // Kronbredd från det lasermätta kronarealet, men aldrig så smal att
-    // trädet blir en pelare — täta trädrader delar celler och får annars
-    // pyttesmå radier.
-    const crownR = Math.max(
-      Math.min(
-        Math.max(t.radius * (0.8 + 0.5 * r01(8)), 1.2),
-        height * (CROWN_TYPES[type].oval ? 0.75 : 0.5)
-      ),
-      crownH * (type === 2 ? 0.3 : 0.42)
-    )
+    // trädet blir en pelare (täta trädrader delar celler och får annars
+    // pyttesmå radier) — och aldrig bredare än ett gathusträd.
+    let crownR = Math.max(t.radius * (0.6 + 0.3 * r01(8)), 1.2)
+    crownR = Math.max(crownR, crownH * (type === 2 ? 0.22 : 0.3))
+    crownR = Math.min(crownR, 3.5, crownH * 0.8)
     const color =
       h % 17 === 0 ? TREE_AUTUMN : TREE_GREENS[(h >>> 4) % TREE_GREENS.length]
     byType[type].push({

@@ -4,16 +4,18 @@
  * byter färg mellan körningar.
  */
 
+// Taken är genomgående gråskala (plåt/papp i stadsmiljö); fasaderna står
+// för kulören.
 export const PALETTE = [
   {
     kind: 'brick',
     walls: [0x9c5e4a, 0x7d4536],
-    roofs: [0x8f4a39],
+    roofs: [0x3d3d40, 0x57575a],
   },
   {
     kind: 'plaster',
     walls: [0xd8b376, 0xb9b3a6, 0xe6e0d4, 0xd9b7a8, 0xcf9b76],
-    roofs: [0x4a4a4e, 0x6a6a66, 0x5a8a78],
+    roofs: [0x46464a, 0x5c5c60, 0x6e6e72, 0x38383b],
   },
 ]
 
@@ -33,9 +35,6 @@ export function pickBuildingStyle(id) {
   const brick = h % 3 === 0
   const p = PALETTE[brick ? 0 : 1]
   const wallColor = p.walls[(h >>> 8) % p.walls.length]
-  // Kopparngrönt (sista putstaket) ska vara enstaka — vikta om det.
-  let roofIdx = (h >>> 16) % p.roofs.length
-  if (!brick && roofIdx === 2 && (h >>> 24) % 4 !== 0) roofIdx = h % 2
-  const roofColor = p.roofs[roofIdx]
+  const roofColor = p.roofs[(h >>> 16) % p.roofs.length]
   return { wallColor, roofColor, isBrick: brick }
 }

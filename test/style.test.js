@@ -40,4 +40,15 @@ describe('pickBuildingStyle', () => {
     const distinct = new Set(ids.map((id) => pickBuildingStyle(id).wallColor))
     expect(distinct.size).toBeGreaterThanOrEqual(5)
   })
+
+  it('alla tak är gråskala', () => {
+    for (const id of ids) {
+      const c = pickBuildingStyle(id).roofColor
+      const r = (c >> 16) & 0xff
+      const g = (c >> 8) & 0xff
+      const b = c & 0xff
+      // gråskala: kanalerna får skilja max ett par steg
+      expect(Math.max(r, g, b) - Math.min(r, g, b)).toBeLessThanOrEqual(6)
+    }
+  })
 })
