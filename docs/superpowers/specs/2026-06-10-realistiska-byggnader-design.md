@@ -49,12 +49,9 @@ Idag: `if (data.terrain.mode !== 'dsm')` hoppar över de extruderade husen, och
 
 Nytt i `dsm`-läget:
 
-- **Basyta** byggs från markgriden (`groundFile` = `terrain.bin`, utan hus/träd).
-  För celler som klassas som **vegetation** används istället DSM-höjden så att
-  trädens silhuett finns kvar som referens — men se punkt 6: träden ritas som
-  egna objekt, så vegetationen i basytan plattas i praktiken till mark och träden
-  läggs ovanpå. Husceller plattas alltid till marknivå (de täcks av extruderade
-  hus). Nettot: basytan är ren mark/vatten.
+- **Basyta** byggs från markgriden (`groundFile` = `terrain.bin`, utan hus/träd) —
+  ren mark/vatten. Både hus och träd är borta ur ytan (markgriden saknar dem) och
+  ersätts av egna objekt: extruderade hus (punkt 1–2) respektive 3D-träd (punkt 6).
 - **Husen** ritas via `makeLaserBuilding` (aktiveras även för `dsm`). Varje hus
   blir en grupp med vägg-mesh + tak-mesh, `castShadow`/`receiveShadow` på.
 - **Skuggvärlden** är fortsatt `occluders = [occluderMesh]`, osynlig och orörd.
