@@ -29,7 +29,8 @@ export function createScene(canvas, data) {
   scene.background = SKY_DAY.clone()
 
   const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 4000)
-  camera.position.set(120, 140, 160)
+  // Brantare default-vinkel så att markören på gården syns över taken.
+  camera.position.set(90, 260, 130)
 
   const controls = new OrbitControls(camera, renderer.domElement)
   controls.target.set(0, 0, 0)
@@ -75,19 +76,19 @@ export function createScene(canvas, data) {
 
   const marker = new THREE.Group()
   const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.15, 0.15, 4, 12),
+    new THREE.CylinderGeometry(0.4, 0.4, 12, 12),
     new THREE.MeshStandardMaterial({ color: 0xd62828 })
   )
-  pole.position.y = groundY + 2
+  pole.position.y = groundY + 6
   const dot = new THREE.Mesh(
-    new THREE.SphereGeometry(0.7, 16, 12),
+    new THREE.SphereGeometry(1.8, 16, 12),
     new THREE.MeshStandardMaterial({
       color: 0xd62828, emissive: 0x801010, emissiveIntensity: 0.6,
     })
   )
-  dot.position.y = groundY + 4
+  dot.position.y = groundY + 12
   const pad = new THREE.Mesh(
-    new THREE.CircleGeometry(3, 32),
+    new THREE.CircleGeometry(4, 32),
     new THREE.MeshStandardMaterial({ color: 0xe0c468, roughness: 0.8 })
   )
   pad.rotation.x = -Math.PI / 2
