@@ -1,0 +1,9 @@
+{
+  "lat": 59.319274089055156,
+  "lon": 18.034358285443005,
+  "areaSize": 500,
+  "courtyardDepth": 2.5,
+  "defaultBuildingHeight": 16,
+  "metersPerLevel": 3,
+  "roofExtra": 1.5
+}
