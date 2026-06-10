@@ -217,6 +217,25 @@ function makeRoads(roads, terrain) {
     }
   }
 
+  // Runda "lock" i varje knutpunkt så att segmenten hänger ihop i kurvor
+  // och korsningar (annars blir det kilformade glipor).
+  const SIDES = 8
+  for (const road of roads) {
+    const hw = road.width / 2
+    for (const [e, n] of road.path) {
+      const yc = terrain.sample(e, n) + lift
+      for (let s = 0; s < SIDES; s++) {
+        const a0 = (s / SIDES) * Math.PI * 2
+        const a1 = ((s + 1) / SIDES) * Math.PI * 2
+        positions.push(
+          e, yc, -n,
+          e + Math.cos(a0) * hw, yc, -(n + Math.sin(a0) * hw),
+          e + Math.cos(a1) * hw, yc, -(n + Math.sin(a1) * hw)
+        )
+      }
+    }
+  }
+
   const geo = new THREE.BufferGeometry()
   geo.setAttribute(
     'position', new THREE.BufferAttribute(new Float32Array(positions), 3)

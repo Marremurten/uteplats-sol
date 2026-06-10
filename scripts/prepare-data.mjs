@@ -285,17 +285,18 @@ out tags geom;`
   console.log('Hämtar vägar från OpenStreetMap...')
   const data = await fetchOverpass(query)
 
+  const MAJOR = new Set(['motorway', 'trunk', 'primary', 'secondary', 'tertiary'])
   const roads = []
   for (const el of data.elements) {
     if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue
     const path = ringToLocal(el.geometry)
     if (!ringInArea(path)) continue
-    roads.push({
-      id: `way/${el.id}`,
-      width: ROAD_WIDTHS[el.tags?.highway] ?? 4,
-      kind: el.tags?.highway,
-      path,
-    })
+    const kind = el.tags?.highway
+    let width = ROAD_WIDTHS[kind] ?? 4
+    // Stora gator ligger ofta som två enkelriktade filer med glapp emellan —
+    // bredda filerna så de smälter ihop visuellt (exakthet oviktig här).
+    if (MAJOR.has(kind) && el.tags?.oneway === 'yes') width *= 1.9
+    roads.push({ id: `way/${el.id}`, width, kind, path })
   }
   writeFileSync(
     join(outDir, 'roads.json'),
