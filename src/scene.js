@@ -119,7 +119,11 @@ export function createScene(canvas, data) {
   // oroterad/oplacerad geometri.
   scene.updateMatrixWorld(true)
 
-  const occluders = [occluderMesh ?? terrainMesh, buildingsGroup]
+  // Med laser-occluder: den ENSAM är skuggvärlden (innehåller mark + hus
+  // med uppmätta takformer). De extruderade husen är då bara visuella.
+  const occluders = occluderMesh
+    ? [occluderMesh]
+    : [terrainMesh, buildingsGroup]
 
   function setSun(sun) {
     const up = Math.max(sun.altitude, 0)
@@ -312,8 +316,11 @@ function makeBuilding(b, terrain, material) {
     baseY = Math.min(baseY, g)
     topGround = Math.max(topGround, g)
   }
+  // Lasermätt takhöjd (absolut möh) går före OSM-uppskattningen.
   const totalHeight =
-    topGround - baseY + b.height + (terrain.buildingExtra ?? 0)
+    b.roofElevation != null && terrain.originElevation != null
+      ? b.roofElevation - terrain.originElevation - baseY
+      : topGround - baseY + b.height + (terrain.buildingExtra ?? 0)
 
   // Shape i XY (x = öst, y = norr), extrudering längs +z, sedan roteras
   // (x, y, z) → (x, z, −y) så att z-djupet blir höjd.

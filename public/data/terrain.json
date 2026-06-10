@@ -1,1 +1,1 @@
-{"mode":"dsm","attribution":"Laserdata ytmodell © Lantmäteriet (CC BY 4.0)","areaSize":500,"gridSize":501,"originElevation":12.720000267028809,"file":"dsm.bin","occluderFile":"dsm_occluder.bin","classFile":"dsm_class.bin","groundFile":"terrain.bin"}
+{"mode":"dtm","attribution":"Höjddata & laserdata © Lantmäteriet (CC BY 4.0)","areaSize":500,"gridSize":501,"originElevation":12.720000267028809,"file":"terrain.bin","occluderFile":"dsm_occluder.bin","classFile":"dsm_class.bin"}

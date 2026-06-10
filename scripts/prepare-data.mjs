@@ -493,6 +493,44 @@ async function buildDsm() {
     occluder[i] = cellClass[i] === 2 ? Math.max(dsm[i], dtm[i]) : dtm[i]
   }
 
+  // Lasermätt takhöjd per hus: medianen av DSM (absolut möh) över husets
+  // celler — skrivs in i buildings.json så visualiseringen kan extrudera
+  // skarpa hus med rätt höjd.
+  const buildingsData = JSON.parse(
+    readFileSync(join(outDir, 'buildings.json'), 'utf8')
+  )
+  let calibrated = 0
+  for (const b of buildingsData.buildings) {
+    const fp = b.footprint
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+    for (const [e, n] of fp) {
+      x0 = Math.min(x0, e); x1 = Math.max(x1, e)
+      y0 = Math.min(y0, n); y1 = Math.max(y1, n)
+    }
+    const zs = []
+    for (let n = Math.ceil(y0); n <= Math.floor(y1); n++) {
+      for (let e = Math.ceil(x0); e <= Math.floor(x1); e++) {
+        const col = Math.round(e + half)
+        const row = Math.round(half - n)
+        if (col < 0 || col > size - 1 || row < 0 || row > size - 1) continue
+        const idx = row * size + col
+        if (cellClass[idx] === 2 && inPoly(e, n, fp)) zs.push(dsm[idx])
+      }
+    }
+    if (zs.length >= 8) {
+      zs.sort((a, b) => a - b)
+      b.roofElevation = Math.round(zs[Math.floor(zs.length / 2)] * 10) / 10
+      calibrated++
+    }
+  }
+  writeFileSync(
+    join(outDir, 'buildings.json'),
+    JSON.stringify(buildingsData, null, 1)
+  )
+  console.log(
+    `${calibrated}/${buildingsData.buildings.length} hus fick lasermätt takhöjd.`
+  )
+
   const center = Math.round(half) * size + Math.round(half)
   writeFileSync(join(outDir, 'dsm.bin'), Buffer.from(dsm.buffer))
   writeFileSync(join(outDir, 'dsm_occluder.bin'), Buffer.from(occluder.buffer))
@@ -500,15 +538,16 @@ async function buildDsm() {
   writeFileSync(
     join(outDir, 'terrain.json'),
     JSON.stringify({
-      mode: 'dsm',
-      attribution: 'Laserdata ytmodell © Lantmäteriet (CC BY 4.0)',
+      // Visuellt: slät markmodell + extruderade hus (lasermätta höjder).
+      // Skuggberäkning: laser-ytmodellen inom husfotavtryck (occluderFile).
+      mode: 'dtm',
+      attribution: 'Höjddata & laserdata © Lantmäteriet (CC BY 4.0)',
       areaSize: cfg.areaSize,
       gridSize: size,
       originElevation: dtm[center], // markens nivå vid uteplatsen
-      file: 'dsm.bin',
+      file: 'terrain.bin',
       occluderFile: 'dsm_occluder.bin',
       classFile: 'dsm_class.bin',
-      groundFile: 'terrain.bin',
     })
   )
   console.log(
