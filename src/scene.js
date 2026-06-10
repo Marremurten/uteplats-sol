@@ -7,6 +7,10 @@ import { pickBuildingStyle, hashId } from './style.js'
 import { dedupeFootprints } from './buildings.js'
 import { detectChimneys } from './chimneys.js'
 import { detectTrees } from './trees.js'
+import { createParticles } from './particles.js'
+import {
+  seasonParams, AUTUMN_CROWN_COLORS, BLOSSOM_COLORS, SPRING_LEAF, TWIG_COLOR,
+} from './seasons.js'
 
 // BVH-accelererade raycasts — terrängen är ~500k trianglar och sveps
 // 288 gånger per dagsfönster.
@@ -17,6 +21,18 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast
 const SKY_DAY = new THREE.Color(0x87b5dd)
 const SKY_LOW = new THREE.Color(0xd9a06b)
 const SKY_NIGHT = new THREE.Color(0x101522)
+
+// Säsongstintade varianter av ljus och himmel (lerpas i setSeason).
+const SKY_DAY_WINTER = new THREE.Color(0xb9cad9)
+const SKY_DAY_AUTUMN = new THREE.Color(0x8fb3d4)
+const SKY_LOW_AUTUMN = new THREE.Color(0xe2a05e)
+const SUN_COLOR = new THREE.Color(0xfff3e0)
+const SUN_WINTER = new THREE.Color(0xe9f1ff)
+const SUN_AUTUMN = new THREE.Color(0xffe0b0)
+const HEMI_SKY = new THREE.Color(0xbdd4ee)
+const HEMI_SKY_WINTER = new THREE.Color(0xcfe0f2)
+const HEMI_GROUND = new THREE.Color(0x3a3a33)
+const HEMI_GROUND_SNOW = new THREE.Color(0x9aa3ad)
 
 /**
  * Bygger three.js-scenen. Returnerar handtag för rendering, solstyrning
@@ -58,8 +74,19 @@ export function createScene(canvas, data) {
   const hemi = new THREE.HemisphereLight(0xbdd4ee, 0x3a3a33, 0.75)
   scene.add(hemi)
 
+  // Säsongsuniforms: delas av terräng-, väg- och takmaterialen så att
+  // hela scenen byter årstid med fem float-skrivningar (terrängen är
+  // ~500k trianglar — CPU-omfärgning per sliderdrag vore för dyrt).
+  const seasonUniforms = {
+    uSnow: { value: 0 },
+    uFrost: { value: 0 },
+    uDull: { value: 0 },
+    uLitter: { value: 0 },
+    uIce: { value: 0 },
+  }
+
   // --- Terräng ---
-  const terrainMesh = makeTerrain(data.terrain)
+  const terrainMesh = makeTerrain(data.terrain, seasonUniforms)
   scene.add(terrainMesh)
   // Låt marken skugga sig själv i kuperad terräng.
   if (data.terrain.mode === 'dsm') terrainMesh.castShadow = true
@@ -76,7 +103,8 @@ export function createScene(canvas, data) {
   }
 
   // --- Vägar (kosmetik, ingår inte i skuggberäkningen) ---
-  if (data.roads?.length) scene.add(makeRoads(data.roads, data.terrain))
+  if (data.roads?.length)
+    scene.add(makeRoads(data.roads, data.terrain, seasonUniforms))
 
   // --- Byggnader (extruderade hus med per-hus-material; i DSM-läget rent
   // visuella — skuggvärlden är laser-occludern ovan) ---
@@ -91,9 +119,7 @@ export function createScene(canvas, data) {
     if (!mats) {
       mats = {
         wall: makeWallMaterial(s.wallColor, nightUniform),
-        roof: new THREE.MeshStandardMaterial({
-          color: s.roofColor, roughness: 0.85,
-        }),
+        roof: makeRoofMaterial(s.roofColor, seasonUniforms),
       }
       styleCache.set(key, mats)
     }
@@ -113,8 +139,12 @@ export function createScene(canvas, data) {
   // --- Träd (instansierade stam + krona per detekterat träd; skuggar
   // visuellt men ingår inte i sol-occludern — medvetet) ---
   const t = data.terrain
-  if (t.classGrid && t.canopyGrid && t.groundGrid)
-    scene.add(makeTreesGroup(t))
+  let updateTreeSeason = () => {}
+  if (t.classGrid && t.canopyGrid && t.groundGrid) {
+    const trees = makeTreesGroup(t)
+    scene.add(trees.group)
+    updateTreeSeason = trees.updateSeason
+  }
 
   // --- Uteplatsmarkören (på marknivå, även om DSM:en skulle ha fångat
   // ett parasoll eller en trädkrona över punkten) ---
@@ -145,6 +175,10 @@ export function createScene(canvas, data) {
   marker.add(pole, dot, pad)
   scene.add(marker)
 
+  // --- Säsongspartiklar (snöfall, fallande löv) — egen loop som bara
+  // körs när intensiteten är > 0 (renderNow är hoisted) ---
+  const particles = createParticles({ scene, renderNow, groundY })
+
   // Raycasts sker innan första renderingen (init-beräkningen av dagens
   // solfönster) — bygg världsmatriserna explicit, annars träffar strålarna
   // oroterad/oplacerad geometri.
@@ -156,6 +190,14 @@ export function createScene(canvas, data) {
     ? [occluderMesh]
     : [terrainMesh, buildingsGroup]
 
+  // Säsongstintade ljus-/himmelsfärger — muteras i setSeason så att
+  // setSun (som körs vid varje sliderevent) förblir allokeringsfri.
+  const skyDaySeason = SKY_DAY.clone()
+  const skyLowSeason = SKY_LOW.clone()
+  const _sky = new THREE.Color()
+  const _mix = new THREE.Color()
+  let hemiSnowBoost = 0
+
   function setSun(sun) {
     const up = Math.max(sun.altitude, 0)
     const dayness = Math.min(up / 0.15, 1) // 0..1 över de första ~8.5°
@@ -166,7 +208,8 @@ export function createScene(canvas, data) {
     } else {
       sunLight.visible = false
     }
-    hemi.intensity = 0.12 + 0.63 * dayness
+    // snötäcket studsar upp himmelsljus — lite extra ambient på vintern
+    hemi.intensity = (0.12 + 0.63 * dayness) * (1 + hemiSnowBoost)
     // Fönstren tänds i skymningen: fullt sken strax under horisonten.
     nightUniform.value = THREE.MathUtils.clamp(
       (0.03 - sun.altitude) / 0.08, 0, 1
@@ -174,19 +217,60 @@ export function createScene(canvas, data) {
     const sky =
       sun.altitude <= 0
         ? SKY_NIGHT
-        : SKY_LOW.clone().lerp(SKY_DAY, dayness)
+        : _sky.copy(skyLowSeason).lerp(skyDaySeason, dayness)
     scene.background.copy(sky)
   }
 
+  const flatGround = !(
+    data.terrain.mode === 'dtm' || data.terrain.mode === 'dsm'
+  )
+
+  function setSeason(p) {
+    seasonUniforms.uSnow.value = p.snowCover
+    seasonUniforms.uFrost.value = p.frost
+    seasonUniforms.uDull.value = p.groundDull
+    seasonUniforms.uLitter.value = p.leafLitter
+    seasonUniforms.uIce.value = p.ice
+    // Platt mark saknar vertexfärger/attribut — tona materialfärgen direkt.
+    if (flatGround) {
+      terrainMesh.material.color
+        .copy(COLOR_GROUND)
+        .lerp(_mix.setHex(0x99906f), p.groundDull)
+        .lerp(_mix.setHex(0xc9ccc2), p.frost * 0.8)
+        .lerp(_mix.setHex(0xedf2f7), p.snowCover)
+    }
+    updateTreeSeason(p)
+    skyDaySeason
+      .copy(SKY_DAY)
+      .lerp(SKY_DAY_AUTUMN, p.autumness)
+      .lerp(SKY_DAY_WINTER, p.winterness)
+    skyLowSeason.copy(SKY_LOW).lerp(SKY_LOW_AUTUMN, p.autumness)
+    sunLight.color
+      .copy(SUN_COLOR)
+      .lerp(SUN_AUTUMN, p.autumness * 0.7)
+      .lerp(SUN_WINTER, p.winterness)
+    hemi.color.copy(HEMI_SKY).lerp(HEMI_SKY_WINTER, p.winterness)
+    hemi.groundColor.copy(HEMI_GROUND).lerp(HEMI_GROUND_SNOW, p.snowCover)
+    hemiSnowBoost = 0.2 * p.snowCover
+    particles.setIntensity({
+      snow: p.snowfallIntensity, leaf: p.leafFallIntensity,
+    })
+  }
+
+  function renderNow() {
+    renderer.render(scene, camera)
+  }
+
   // Rendera på begäran i stället för 60 fps — scenen är statisk mellan
-  // interaktioner och terrängen är tung (~500k trianglar).
+  // interaktioner och terrängen är tung (~500k trianglar). Medan
+  // partikelloopen kör renderar den varje frame; då är detta en no-op.
   let renderPending = false
   function requestRender() {
-    if (renderPending) return
+    if (renderPending || particles.running) return
     renderPending = true
     requestAnimationFrame(() => {
       renderPending = false
-      renderer.render(scene, camera)
+      renderNow()
     })
   }
   controls.addEventListener('change', requestRender)
@@ -202,7 +286,7 @@ export function createScene(canvas, data) {
   window.addEventListener('resize', resize)
   resize()
 
-  return { requestRender, setSun, samplePoint, occluders }
+  return { requestRender, setSun, setSeason, samplePoint, occluders }
 }
 
 // Mälarens yta ligger ~0,86 möh (RH 2000); DTM:n är hydro-utplattad så
@@ -236,7 +320,7 @@ function makeGridMesh(terrain, grid, material) {
   return mesh
 }
 
-function makeTerrain(terrain) {
+function makeTerrain(terrain, seasonUniforms) {
   const size = terrain.areaSize
   let geo
   let material
@@ -266,9 +350,40 @@ function makeTerrain(terrain) {
       colors[i * 3 + 2] = c.b
     }
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    // Säsongsmasker: vatten ur klassgriden (fryser till is), lövförna
+    // i en avklingande zon kring vegetationsceller.
+    const water = new Float32Array(pos.count)
+    for (let i = 0; i < pos.count; i++) {
+      water[i] = terrain.classGrid
+        ? terrain.classGrid[i] === 1 ? 1 : 0
+        : heightGrid[i] < WATER_LEVEL ? 1 : 0
+    }
+    geo.setAttribute('aWater', new THREE.BufferAttribute(water, 1))
+    const litter = terrain.classGrid
+      ? litterMask(terrain.classGrid, terrain.gridSize)
+      : new Float32Array(pos.count)
+    geo.setAttribute('aLitter', new THREE.BufferAttribute(litter, 1))
     geo.computeVertexNormals()
     material = new THREE.MeshStandardMaterial({
       vertexColors: true, roughness: 1,
+    })
+    injectSeasonTint(material, seasonUniforms, {
+      masks: true,
+      glsl: `
+        float upness = smoothstep(0.45, 0.8, normalize(vSeaNormal).y);
+        if (vWater > 0.5) {
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.81, 0.86, 0.90), uIce);
+        } else {
+          float luma = dot(diffuseColor.rgb, vec3(0.3, 0.5, 0.2));
+          diffuseColor.rgb = mix(diffuseColor.rgb,
+            vec3(luma * 1.05, luma * 0.95, luma * 0.75), uDull);
+          diffuseColor.rgb = mix(diffuseColor.rgb,
+            vec3(0.60, 0.48, 0.27), uLitter * vLitter * 0.8);
+          diffuseColor.rgb = mix(diffuseColor.rgb,
+            vec3(0.79, 0.80, 0.76), uFrost * 0.8);
+          diffuseColor.rgb = mix(diffuseColor.rgb,
+            vec3(0.93, 0.95, 0.97), uSnow * upness);
+        }`,
     })
   } else {
     geo = new THREE.PlaneGeometry(size, size, 1, 1)
@@ -283,8 +398,116 @@ function makeTerrain(terrain) {
   return mesh
 }
 
+/**
+ * Injicerar säsongstintning av diffusfärgen i ett standardmaterial.
+ * Världsnormalen skickas som egen varying — terrängen är roterad −π/2 och
+ * chunkarnas `normal` är view-space, så den duger inte för "uppåthet".
+ * Samma injektionspunkt som fönstershadern (efter färg, före ljussättning).
+ */
+function injectSeasonTint(mat, seasonUniforms, { masks = false, glsl }) {
+  mat.onBeforeCompile = (shader) => {
+    for (const k of Object.keys(seasonUniforms))
+      shader.uniforms[k] = seasonUniforms[k]
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+        varying vec3 vSeaNormal;` +
+          (masks
+            ? `
+        attribute float aWater;
+        attribute float aLitter;
+        varying float vWater;
+        varying float vLitter;`
+            : '')
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        vSeaNormal = normalize(mat3(modelMatrix) * objectNormal);` +
+          (masks
+            ? `
+        vWater = aWater;
+        vLitter = aLitter;`
+            : '')
+      )
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+        uniform float uSnow;
+        uniform float uFrost;
+        uniform float uDull;
+        uniform float uLitter;
+        uniform float uIce;
+        varying vec3 vSeaNormal;` +
+          (masks
+            ? `
+        varying float vWater;
+        varying float vLitter;`
+            : '')
+      )
+      .replace(
+        '#include <emissivemap_fragment>',
+        `#include <emissivemap_fragment>
+        {
+          ${glsl}
+        }`
+      )
+  }
+  return mat
+}
+
+// Lövförnemask: närhet till vegetationsceller (klass 3) med linjär
+// avklingning — två separabla max-pass (rader, sedan kolumner).
+function litterMask(classGrid, size) {
+  const R = 3
+  const tmp = new Float32Array(classGrid.length)
+  const out = new Float32Array(classGrid.length)
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c < size; c++) {
+      let m = 0
+      for (let d = -R; d <= R; d++) {
+        const cc = c + d
+        if (cc < 0 || cc >= size) continue
+        if (classGrid[r * size + cc] !== 3) continue
+        const v = 1 - Math.abs(d) / (R + 1)
+        if (v > m) m = v
+      }
+      tmp[r * size + c] = m
+    }
+  }
+  for (let c = 0; c < size; c++) {
+    for (let r = 0; r < size; r++) {
+      let m = 0
+      for (let d = -R; d <= R; d++) {
+        const rr = r + d
+        if (rr < 0 || rr >= size) continue
+        const v = tmp[rr * size + c] * (1 - Math.abs(d) / (R + 1))
+        if (v > m) m = v
+      }
+      out[r * size + c] = m
+    }
+  }
+  return out
+}
+
+// Tak: snön lägger sig på flacka ytor; branta tak fäller den.
+function makeRoofMaterial(color, seasonUniforms) {
+  return injectSeasonTint(
+    new THREE.MeshStandardMaterial({ color, roughness: 0.85 }),
+    seasonUniforms,
+    {
+      glsl: `
+        float upness = smoothstep(0.35, 0.75, normalize(vSeaNormal).y);
+        diffuseColor.rgb = mix(diffuseColor.rgb,
+          vec3(0.93, 0.95, 0.97), uSnow * upness);`,
+    }
+  )
+}
+
 // Vägar som plana band draperade strax ovanför terrängen.
-function makeRoads(roads, terrain) {
+function makeRoads(roads, terrain, seasonUniforms) {
   const positions = []
   const lift = 0.18 // över marken, under skuggkänslighet
 
@@ -340,7 +563,17 @@ function makeRoads(roads, terrain) {
   geo.computeVertexNormals()
   const mesh = new THREE.Mesh(
     geo,
-    new THREE.MeshStandardMaterial({ color: 0x6e6e6e, roughness: 0.95 })
+    injectSeasonTint(
+      new THREE.MeshStandardMaterial({ color: 0x6e6e6e, roughness: 0.95 }),
+      seasonUniforms,
+      {
+        // halv styrka: vägarna läses som plogade/körda
+        glsl: `
+        float upness = smoothstep(0.45, 0.8, normalize(vSeaNormal).y);
+        diffuseColor.rgb = mix(diffuseColor.rgb,
+          vec3(0.88, 0.90, 0.92), uSnow * 0.45 * upness);`,
+      }
+    )
   )
   mesh.receiveShadow = true
   return mesh
@@ -660,7 +893,7 @@ const CROWN_TYPES = [
 ]
 const TRUNK_GEO = new THREE.CylinderGeometry(0.6, 1, 1, 6)
 const TREE_GREENS = [0x4f7a42, 0x5e8a4d, 0x6f9a55, 0x47703f, 0x86975a]
-const TREE_AUTUMN = 0xb3893e
+const CONIFER_WINTER = 0x3d5c3a
 
 /**
  * Detekterar enskilda träd ur laserdatan och bygger dem som instansierade
@@ -719,20 +952,29 @@ function makeTreesGroup(terrain) {
     let crownR = Math.max(t.radius * (0.6 + 0.3 * r01(8)), 1.2)
     crownR = Math.max(crownR, crownH * (type === 2 ? 0.22 : 0.3))
     crownR = Math.min(crownR, 3.5, crownH * 0.8)
-    const color =
-      h % 17 === 0 ? TREE_AUTUMN : TREE_GREENS[(h >>> 4) % TREE_GREENS.length]
     byType[type].push({
       e: t.e, n: t.n, y: t.ground - z0,
       height, trunkH, crownH, crownR,
       rotY: r01(16) * Math.PI * 2,
       tilt: (r01(20) - 0.5) * 0.08,
-      color,
+      // Säsongsfärgerna är deterministiska per träd, precis som formen:
+      // samma träd får samma höstkulör varje år.
+      summerColor: TREE_GREENS[(h >>> 4) % TREE_GREENS.length],
+      autumnColor: AUTUMN_CROWN_COLORS[(h >>> 12) % AUTUMN_CROWN_COLORS.length],
+      blossomColor:
+        h % 6 === 0 ? BLOSSOM_COLORS[(h >>> 7) % BLOSSOM_COLORS.length] : null,
+      jitter: ((h >>> 24) & 0xff) / 255,
     })
   }
 
   const group = new THREE.Group()
   const dummy = new THREE.Object3D()
-  const crownMat = new THREE.MeshStandardMaterial({ roughness: 0.95 })
+  // Löv- och barrkronor behöver olika säsongsbeteende (opacity och
+  // skuggor styrs per material) — därför två material.
+  const deciduousMat = new THREE.MeshStandardMaterial({
+    roughness: 0.95, transparent: true,
+  })
+  const coniferMat = new THREE.MeshStandardMaterial({ roughness: 0.95 })
   const trunkMat = new THREE.MeshStandardMaterial({
     color: 0x5d4a36, roughness: 1,
   })
@@ -753,25 +995,70 @@ function makeTreesGroup(terrain) {
   trunks.castShadow = true
   group.add(trunks)
 
+  const crownMeshes = []
   CROWN_TYPES.forEach((ct, type) => {
     const list = byType[type]
     if (!list.length) return
-    const mesh = new THREE.InstancedMesh(ct.geo, crownMat, list.length)
-    const c = new THREE.Color()
-    list.forEach((t, i) => {
-      dummy.position.set(t.e, t.y + t.trunkH + t.crownH / 2, -t.n)
-      dummy.rotation.set(t.tilt, t.rotY, t.tilt)
-      dummy.scale.set(
-        t.crownR * (ct.oval ? 1.25 : 1),
-        type === 2 ? t.crownH : t.crownH / 2,
-        t.crownR,
-      )
-      dummy.updateMatrix()
-      mesh.setMatrixAt(i, dummy.matrix)
-      mesh.setColorAt(i, c.setHex(t.color))
-    })
+    const mesh = new THREE.InstancedMesh(
+      ct.geo, type === 2 ? coniferMat : deciduousMat, list.length
+    )
     mesh.castShadow = true
+    crownMeshes.push({ mesh, list, conifer: type === 2, oval: ct.oval })
     group.add(mesh)
   })
-  return group
+
+  // Skriver kronornas matriser och färger för en given årstid. Körs en
+  // gång per ändrad dag — några hundra instanser, långt under 1 ms.
+  const cBase = new THREE.Color()
+  const cMix = new THREE.Color()
+  function updateSeason(p) {
+    for (const { mesh, list, conifer, oval } of crownMeshes) {
+      list.forEach((t, i) => {
+        let f = 1
+        if (conifer) {
+          // Barrträd fäller inga barr: mörkare vintergrönt + snöpudring.
+          cBase
+            .setHex(t.summerColor)
+            .lerp(cMix.setHex(CONIFER_WINTER), p.winterness * 0.5)
+            .lerp(cMix.set(1, 1, 1), p.snowCover * 0.18)
+        } else {
+          // Jittern staggar varje träds tajming någon vecka.
+          const local = (x) =>
+            Math.min(Math.max((x - 0.35 * t.jitter) / 0.65, 0), 1)
+          f = local(p.foliage)
+          const a = local(p.autumnBlend)
+          const b = t.blossomColor ? p.blossom : 0
+          if (b > f) f = b // blommande kronor är fulla
+          const maturity = f * f * (3 - 2 * f)
+          cBase
+            .setHex(SPRING_LEAF)
+            .lerp(cMix.setHex(t.summerColor), maturity)
+            .lerp(cMix.setHex(t.autumnColor), a)
+          if (b > 0) cBase.lerp(cMix.setHex(t.blossomColor), b)
+          // kal krona = liten gråbrun "riskrona" i kvistton
+          cBase.lerp(cMix.setHex(TWIG_COLOR), 1 - f)
+        }
+        mesh.setColorAt(i, cBase)
+
+        const s = conifer ? 1 : 0.55 + 0.45 * f
+        dummy.position.set(t.e, t.y + t.trunkH + t.crownH / 2, -t.n)
+        dummy.rotation.set(t.tilt, t.rotY, t.tilt)
+        dummy.scale.set(
+          t.crownR * (oval ? 1.25 : 1) * s,
+          (conifer ? t.crownH : t.crownH / 2) * s,
+          t.crownR * s,
+        )
+        dummy.updateMatrix()
+        mesh.setMatrixAt(i, dummy.matrix)
+      })
+      mesh.instanceColor.needsUpdate = true
+      mesh.instanceMatrix.needsUpdate = true
+      // Fulla kronblobbar som skuggor under kala träd ser fel ut.
+      if (!conifer) mesh.castShadow = p.foliage > 0.25
+    }
+    deciduousMat.opacity = 0.45 + 0.55 * p.foliage
+  }
+
+  updateSeason(seasonParams(172)) // sommardefault tills setSeason körs
+  return { group, updateSeason }
 }

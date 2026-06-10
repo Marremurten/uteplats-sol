@@ -18,6 +18,7 @@
     .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
     .row label { width: 52px; font-size: 13px; color: #555; }
     .row output { width: 72px; font-size: 14px; font-weight: 600; text-align: right; }
+    #season-icon { width: 20px; font-size: 15px; }
     input[type="range"] { flex: 1; }
     #status {
       margin-top: 12px; padding: 10px 12px; border-radius: 8px;
@@ -42,6 +43,7 @@
       <label for="date-slider">Datum</label>
       <input type="range" id="date-slider" min="1" max="365" value="172" />
       <output id="date-label"></output>
+      <span id="season-icon" aria-hidden="true"></span>
     </div>
     <div class="row">
       <label for="time-slider">Tid</label>

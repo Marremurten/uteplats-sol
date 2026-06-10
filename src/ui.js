@@ -1,4 +1,5 @@
 import { sunTimes } from './sun.js'
+import { seasonParams } from './seasons.js'
 
 const YEAR = new Date().getFullYear()
 
@@ -25,6 +26,7 @@ export function setupUI({ lat, lon, onChange, getWindows }) {
     date: document.getElementById('date-slider'),
     time: document.getElementById('time-slider'),
     dateLabel: document.getElementById('date-label'),
+    seasonIcon: document.getElementById('season-icon'),
     timeLabel: document.getElementById('time-label'),
     status: document.getElementById('status'),
     windows: document.getElementById('windows'),
@@ -54,6 +56,7 @@ export function setupUI({ lat, lon, onChange, getWindows }) {
     const key = el.date.value
     if (key !== windowsCacheKey) {
       windowsCacheKey = key
+      el.seasonIcon.textContent = seasonParams(Number(key)).icon
       windowsCache = getWindows(date)
       el.windows.replaceChildren()
       if (windowsCache.length) {
@@ -78,7 +81,7 @@ export function setupUI({ lat, lon, onChange, getWindows }) {
       }
     }
 
-    const sunlitNow = onChange(date)
+    const sunlitNow = onChange(date, Number(el.date.value))
     if (sunlitNow === null) {
       el.status.textContent = '🌙 Solen är under horisonten'
       el.status.className = 'night'

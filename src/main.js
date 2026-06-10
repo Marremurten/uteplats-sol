@@ -5,6 +5,7 @@ import { setupUI } from './ui.js'
 import { sunDirection } from './sun.js'
 import { gridConvergence } from './coords.js'
 import { isSunlit, sunWindows } from './shade.js'
+import { seasonParams } from './seasons.js'
 
 async function init() {
   const data = await loadData()
@@ -14,9 +15,8 @@ async function init() {
   const gridRot = gridConvergence(lon, lat)
 
   const canvas = document.getElementById('scene')
-  const { requestRender, setSun, samplePoint, occluders } = createScene(
-    canvas, data
-  )
+  const { requestRender, setSun, setSeason, samplePoint, occluders } =
+    createScene(canvas, data)
 
   document.getElementById('attribution').textContent =
     data.attributions.join(' · ') +
@@ -24,10 +24,17 @@ async function init() {
       ? ` · Platt mark (gårdsdjup ${data.terrain.courtyardDepth} m) — kör pipelinen med Geotorget-konto för riktig terräng`
       : '')
 
+  let lastDoy = null
   setupUI({
     lat,
     lon,
-    onChange(date) {
+    onChange(date, doy) {
+      // Säsongen beror bara på dagen — tidsreglaget ska inte trigga
+      // omräkning av träd/mark.
+      if (doy !== lastDoy) {
+        lastDoy = doy
+        setSeason(seasonParams(doy))
+      }
       const sun = sunDirection(date, lat, lon, gridRot)
       setSun(sun)
       requestRender()
