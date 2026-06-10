@@ -97,6 +97,11 @@ export function createScene(canvas, data) {
   marker.add(pole, dot, pad)
   scene.add(marker)
 
+  // Raycasts sker innan första renderingen (init-beräkningen av dagens
+  // solfönster) — bygg världsmatriserna explicit, annars träffar strålarna
+  // oroterad/oplacerad geometri.
+  scene.updateMatrixWorld(true)
+
   const occluders = [terrainMesh, buildingsGroup]
 
   function setSun(sun) {

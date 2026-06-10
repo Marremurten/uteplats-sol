@@ -1,3 +1,4 @@
+import * as THREE from 'three'
 import { loadData } from './data.js'
 import { createScene } from './scene.js'
 import { setupUI } from './ui.js'
@@ -39,6 +40,36 @@ async function init() {
   })
 
   requestRender()
+
+  // Debug-lucka för tester/felsökning: vad blockerar solen vid tidpunkt t?
+  window.__app = {
+    sunAt: (iso) => sunDirection(new Date(iso), lat, lon, gridRot),
+    isSunlitAt: (iso) =>
+      isSunlit(new Date(iso), lat, lon, samplePoint, occluders, gridRot),
+    windowsAt: (iso) =>
+      sunWindows(new Date(iso), lat, lon, samplePoint, occluders, 5, gridRot)
+        .map((w) => `${w.start.toTimeString().slice(0, 5)}–${w.end.toTimeString().slice(0, 5)}`),
+    blockerAt: (iso) => {
+      const sun = sunDirection(new Date(iso), lat, lon, gridRot)
+      if (sun.altitude <= 0) return { sun, hit: 'under horisonten' }
+      const rc = new THREE.Raycaster(
+        samplePoint.clone(),
+        new THREE.Vector3(sun.x, sun.y, sun.z).normalize()
+      )
+      rc.firstHitOnly = true
+      const hits = rc.intersectObjects(occluders, true)
+      return {
+        sunAltDeg: (sun.altitude * 180) / Math.PI,
+        hit: hits[0]
+          ? {
+              id: hits[0].object.userData.id ?? 'terräng',
+              distance: Math.round(hits[0].distance),
+              point: hits[0].point.toArray().map((v) => Math.round(v)),
+            }
+          : null,
+      }
+    },
+  }
 }
 
 init().catch((err) => {
