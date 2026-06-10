@@ -2,6 +2,8 @@ import * as THREE from 'three'
 import { sunDirection } from './sun.js'
 
 const _raycaster = new THREE.Raycaster()
+// three-mesh-bvh: vi behöver bara veta OM något träffas, inte alla träffar.
+_raycaster.firstHitOnly = true
 const _origin = new THREE.Vector3()
 const _dir = new THREE.Vector3()
 

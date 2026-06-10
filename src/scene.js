@@ -1,5 +1,14 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import {
+  computeBoundsTree, disposeBoundsTree, acceleratedRaycast,
+} from 'three-mesh-bvh'
+
+// BVH-accelererade raycasts — terrängen är ~500k trianglar och sveps
+// 288 gånger per dagsfönster.
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree
+THREE.Mesh.prototype.raycast = acceleratedRaycast
 
 const SKY_DAY = new THREE.Color(0x87b5dd)
 const SKY_LOW = new THREE.Color(0xd9a06b)
@@ -44,6 +53,9 @@ export function createScene(canvas, data) {
   // --- Terräng ---
   const terrainMesh = makeTerrain(data.terrain)
   scene.add(terrainMesh)
+
+  // --- Vägar (kosmetik, ingår inte i skuggberäkningen) ---
+  if (data.roads?.length) scene.add(makeRoads(data.roads, data.terrain))
 
   // --- Byggnader ---
   const buildingsGroup = new THREE.Group()
@@ -104,45 +116,116 @@ export function createScene(canvas, data) {
     scene.background.copy(sky)
   }
 
+  // Rendera på begäran i stället för 60 fps — scenen är statisk mellan
+  // interaktioner och terrängen är tung (~500k trianglar).
+  let renderPending = false
+  function requestRender() {
+    if (renderPending) return
+    renderPending = true
+    requestAnimationFrame(() => {
+      renderPending = false
+      renderer.render(scene, camera)
+    })
+  }
+  controls.addEventListener('change', requestRender)
+
   function resize() {
     const w = canvas.clientWidth
     const h = canvas.clientHeight
     renderer.setSize(w, h, false)
     camera.aspect = w / h
     camera.updateProjectionMatrix()
+    requestRender()
   }
   window.addEventListener('resize', resize)
   resize()
 
-  function render() {
-    controls.update()
-    renderer.render(scene, camera)
-  }
-
-  return { render, setSun, samplePoint, occluders }
+  return { requestRender, setSun, samplePoint, occluders }
 }
+
+// Mälarens yta ligger ~0,86 möh (RH 2000); DTM:n är hydro-utplattad så
+// allt under den här nivån är vatten.
+const WATER_LEVEL = 1.2
+const COLOR_GROUND = new THREE.Color(0x8a9a7b)
+const COLOR_WATER = new THREE.Color(0x3e6f9e)
 
 function makeTerrain(terrain) {
   const size = terrain.areaSize
   let geo
+  let material
   if (terrain.mode === 'dtm') {
     const seg = terrain.gridSize - 1
     geo = new THREE.PlaneGeometry(size, size, seg, seg)
     const pos = geo.attributes.position
     const z0 = terrain.originElevation
+    const colors = new Float32Array(pos.count * 3)
     // PlaneGeometry: rad 0 = +y (norr efter rotation), vänster→höger = +x.
     for (let i = 0; i < pos.count; i++) {
-      pos.setZ(i, terrain.grid[i] - z0)
+      const elev = terrain.grid[i]
+      pos.setZ(i, elev - z0)
+      const c = elev < WATER_LEVEL ? COLOR_WATER : COLOR_GROUND
+      colors[i * 3] = c.r
+      colors[i * 3 + 1] = c.g
+      colors[i * 3 + 2] = c.b
     }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
     geo.computeVertexNormals()
+    material = new THREE.MeshStandardMaterial({
+      vertexColors: true, roughness: 1,
+    })
   } else {
     geo = new THREE.PlaneGeometry(size, size, 1, 1)
+    material = new THREE.MeshStandardMaterial({
+      color: COLOR_GROUND, roughness: 1,
+    })
   }
+  geo.computeBoundsTree()
+  const mesh = new THREE.Mesh(geo, material)
+  mesh.rotation.x = -Math.PI / 2 // XY-plan → XZ-plan, +y → −z (norr)
+  mesh.receiveShadow = true
+  return mesh
+}
+
+// Vägar som plana band draperade strax ovanför terrängen.
+function makeRoads(roads, terrain) {
+  const positions = []
+  const lift = 0.18 // över marken, under skuggkänslighet
+
+  for (const road of roads) {
+    const p = road.path
+    const hw = road.width / 2
+    for (let i = 0; i < p.length - 1; i++) {
+      const [e0, n0] = p[i]
+      const [e1, n1] = p[i + 1]
+      const dx = e1 - e0
+      const dn = n1 - n0
+      const len = Math.hypot(dx, dn)
+      if (len < 0.01) continue
+      // perpendikulär i markplanet
+      const px = (-dn / len) * hw
+      const pn = (dx / len) * hw
+      const y00 = terrain.sample(e0 + px, n0 + pn) + lift
+      const y01 = terrain.sample(e0 - px, n0 - pn) + lift
+      const y10 = terrain.sample(e1 + px, n1 + pn) + lift
+      const y11 = terrain.sample(e1 - px, n1 - pn) + lift
+      // två trianglar per segment; (e, n) → (x: e, y: höjd, z: −n).
+      // Moturs sett uppifrån (+y) så att normalerna pekar upp.
+      positions.push(
+        e0 + px, y00, -(n0 + pn), e0 - px, y01, -(n0 - pn), e1 + px, y10, -(n1 + pn),
+        e1 + px, y10, -(n1 + pn), e0 - px, y01, -(n0 - pn), e1 - px, y11, -(n1 - pn)
+      )
+    }
+  }
+
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute(
+    'position', new THREE.BufferAttribute(new Float32Array(positions), 3)
+  )
+  geo.computeVertexNormals()
   const mesh = new THREE.Mesh(
     geo,
-    new THREE.MeshStandardMaterial({ color: 0x8a9a7b, roughness: 1 })
+    new THREE.MeshStandardMaterial({ color: 0x6e6e6e, roughness: 0.95 })
   )
-  mesh.rotation.x = -Math.PI / 2 // XY-plan → XZ-plan, +y → −z (norr)
   mesh.receiveShadow = true
   return mesh
 }
@@ -174,6 +257,7 @@ function makeBuilding(b, terrain, material) {
     depth: totalHeight,
     bevelEnabled: false,
   })
+  geo.computeBoundsTree()
   const mesh = new THREE.Mesh(geo, material)
   mesh.rotation.x = -Math.PI / 2
   mesh.position.y = baseY

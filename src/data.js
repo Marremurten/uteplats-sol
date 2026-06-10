@@ -4,9 +4,14 @@
  * uteplatsen = 0).
  */
 export async function loadData() {
-  const [terrainMeta, buildingsData] = await Promise.all([
+  const [terrainMeta, buildingsData, roadsData] = await Promise.all([
     fetch('data/terrain.json').then(mustJson('terrain.json')),
     fetch('data/buildings.json').then(mustJson('buildings.json')),
+    // Vägar är valfri kosmetika — saknas filen (eller svarar dev-servern
+    // med HTML-fallback) visas scenen utan vägar.
+    fetch('data/roads.json')
+      .then((r) => r.json())
+      .catch(() => ({ roads: [] })),
   ])
 
   let terrain
@@ -64,6 +69,7 @@ export async function loadData() {
     site: buildingsData.origin,
     areaSize: buildingsData.areaSize,
     buildings: buildingsData.buildings,
+    roads: roadsData.roads,
     terrain,
     attributions: [
       buildingsData.attribution,

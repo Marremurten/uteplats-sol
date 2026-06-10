@@ -13,7 +13,9 @@ async function init() {
   const gridRot = gridConvergence(lon, lat)
 
   const canvas = document.getElementById('scene')
-  const { render, setSun, samplePoint, occluders } = createScene(canvas, data)
+  const { requestRender, setSun, samplePoint, occluders } = createScene(
+    canvas, data
+  )
 
   document.getElementById('attribution').textContent =
     data.attributions.join(' · ') +
@@ -27,6 +29,7 @@ async function init() {
     onChange(date) {
       const sun = sunDirection(date, lat, lon, gridRot)
       setSun(sun)
+      requestRender()
       if (sun.altitude <= 0) return null
       return isSunlit(date, lat, lon, samplePoint, occluders, gridRot)
     },
@@ -35,11 +38,7 @@ async function init() {
     },
   })
 
-  renderLoop()
-  function renderLoop() {
-    render()
-    requestAnimationFrame(renderLoop)
-  }
+  requestRender()
 }
 
 init().catch((err) => {

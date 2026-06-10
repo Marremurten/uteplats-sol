@@ -148,9 +148,24 @@ out tags geom;`
   )
 }
 
+function readEnvLocal() {
+  try {
+    const lines = readFileSync(join(root, '.env.local'), 'utf8').split('\n')
+    const env = {}
+    for (const line of lines) {
+      const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+?)\s*$/)
+      if (m) env[m[1]] = m[2]
+    }
+    return env
+  } catch {
+    return {}
+  }
+}
+
 async function buildTerrain() {
-  const user = process.env.GEOTORGET_USER
-  const pass = process.env.GEOTORGET_PASS
+  const envLocal = readEnvLocal()
+  const user = process.env.GEOTORGET_USER ?? envLocal.GEOTORGET_USER
+  const pass = process.env.GEOTORGET_PASS ?? envLocal.GEOTORGET_PASS
   if (!user || !pass) {
     console.log(
       'Ingen Geotorget-inloggning (GEOTORGET_USER/GEOTORGET_PASS) — ' +
@@ -254,6 +269,48 @@ async function buildTerrain() {
   )
 }
 
-await buildBuildings()
-await buildTerrain()
+// Vägbredd (meter) per OSM-vägklass — för visualiseringen.
+const ROAD_WIDTHS = {
+  motorway: 10, trunk: 10, primary: 9, secondary: 7, tertiary: 6,
+  residential: 5, unclassified: 5, service: 4, living_street: 4,
+  pedestrian: 4, footway: 2, path: 2, cycleway: 2.5, steps: 2,
+}
+
+async function buildRoads() {
+  const [s, w, n, e] = bbox
+  const types = Object.keys(ROAD_WIDTHS).join('|')
+  const query = `[out:json][timeout:90];
+way["highway"~"^(${types})$"](${s},${w},${n},${e});
+out tags geom;`
+  console.log('Hämtar vägar från OpenStreetMap...')
+  const data = await fetchOverpass(query)
+
+  const roads = []
+  for (const el of data.elements) {
+    if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue
+    const path = ringToLocal(el.geometry)
+    if (!ringInArea(path)) continue
+    roads.push({
+      id: `way/${el.id}`,
+      width: ROAD_WIDTHS[el.tags?.highway] ?? 4,
+      kind: el.tags?.highway,
+      path,
+    })
+  }
+  writeFileSync(
+    join(outDir, 'roads.json'),
+    JSON.stringify({
+      attribution: '© OpenStreetMap contributors (ODbL)',
+      roads,
+    })
+  )
+  console.log(`${roads.length} vägsegment.`)
+}
+
+// Välj steg: --buildings / --terrain / --roads (inga flaggor = alla)
+const args = process.argv.slice(2)
+const all = args.length === 0
+if (all || args.includes('--buildings')) await buildBuildings()
+if (all || args.includes('--terrain')) await buildTerrain()
+if (all || args.includes('--roads')) await buildRoads()
 console.log('Klart. Data i public/data/')
