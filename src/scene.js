@@ -4,6 +4,7 @@ import {
   computeBoundsTree, disposeBoundsTree, acceleratedRaycast,
 } from 'three-mesh-bvh'
 import { pickBuildingStyle, hashId } from './style.js'
+import { dedupeFootprints } from './buildings.js'
 import { detectChimneys } from './chimneys.js'
 import { detectTrees } from './trees.js'
 
@@ -90,10 +91,6 @@ export function createScene(canvas, data) {
     if (!mats) {
       mats = {
         wall: makeWallMaterial(s.wallColor, nightUniform),
-        // Branta takpartier ritas med fasadkulör men utan fönster.
-        wallPlain: new THREE.MeshStandardMaterial({
-          color: s.wallColor, roughness: 0.9,
-        }),
         roof: new THREE.MeshStandardMaterial({
           color: s.roofColor, roughness: 0.85,
         }),
@@ -103,7 +100,7 @@ export function createScene(canvas, data) {
     return mats
   }
   const buildingsGroup = new THREE.Group()
-  for (const b of data.buildings) {
+  for (const b of dedupeFootprints(data.buildings)) {
     // Med laserdata: skarpa väggar till takfoten + laserformat tak
     // (nockar, valmningar) och skorstenar. Annars: platt låda.
     const mesh = data.terrain.sampleOccluder
@@ -366,9 +363,7 @@ function pointInPolygon(e, n, fp) {
  * fotavtrycket), och taket är ett 1 m-grid av laserytan, klippt mot
  * fotavtrycket och nedvikt till takfoten i kanterna.
  *
- * mats: { wall, wallPlain, roof } — taktrianglar brantare än ~60° ritas
- * med fasadkulören (wallPlain) så att höga takkanter läses som vägg, inte
- * tak. Spikar som medianfiltret tar bort blir skorstenar.
+ * mats: { wall, roof }. Spikar som medianfiltret tar bort blir skorstenar.
  */
 function makeLaserBuilding(b, terrain, mats) {
   const ring = b.footprint
@@ -485,7 +480,12 @@ function makeLaserBuilding(b, terrain, mats) {
   const tris = []
   const heightAt = (e, n) => {
     const h = inside.get(`${e},${n}`)
-    return h === undefined ? eaveY : Math.min(Math.max(h, eaveY), ridgeCap)
+    // Utanför fotavtrycket viks ytan ner en bit UNDER takfoten (in bakom
+    // väggen) och innanför ligger den strax ÖVER — ligger något av dem
+    // exakt i takfotsplanet z-fightas det med väggens topplock till ett
+    // vitt flimmer.
+    if (h === undefined) return eaveY - 0.6
+    return Math.min(Math.max(h, eaveY + 0.05), ridgeCap)
   }
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
@@ -508,42 +508,13 @@ function makeLaserBuilding(b, terrain, mats) {
       tris.push(a, bb, cc, bb, dd, cc)
     }
   }
-  // Tak vs fasad: branta trianglar (>60° från horisontalplanet,
-  // |normal.y| < 0,5) vid fotavtryckets KANT är takkjol — de ritas med
-  // fasadkulören så att taket inte "rinner ner" på fasaden. Branta partier
-  // mitt på taket (takkupor, nivåskillnader) behåller takfärgen.
-  const atEdge = (i) => {
-    const c = i % cols
-    const r = (i - c) / cols
-    return !isIn(r, c)
-  }
-  const flatTris = []
-  const steepTris = []
-  for (let t = 0; t < tris.length; t += 3) {
-    const [i0, i1, i2] = [tris[t], tris[t + 1], tris[t + 2]]
-    const ax = verts[i1 * 3] - verts[i0 * 3]
-    const ay = verts[i1 * 3 + 1] - verts[i0 * 3 + 1]
-    const az = verts[i1 * 3 + 2] - verts[i0 * 3 + 2]
-    const bx = verts[i2 * 3] - verts[i0 * 3]
-    const by = verts[i2 * 3 + 1] - verts[i0 * 3 + 1]
-    const bz = verts[i2 * 3 + 2] - verts[i0 * 3 + 2]
-    const nx = ay * bz - az * by
-    const ny = az * bx - ax * bz
-    const nz = ax * by - ay * bx
-    const len = Math.hypot(nx, ny, nz) || 1
-    const steep = Math.abs(ny) / len < 0.5
-    const skirt = steep && (atEdge(i0) || atEdge(i1) || atEdge(i2))
-    ;(skirt ? steepTris : flatTris).push(i0, i1, i2)
-  }
   const roofGeo = new THREE.BufferGeometry()
   roofGeo.setAttribute(
     'position', new THREE.BufferAttribute(new Float32Array(verts), 3)
   )
-  roofGeo.setIndex([...flatTris, ...steepTris])
-  roofGeo.addGroup(0, flatTris.length, 0)
-  roofGeo.addGroup(flatTris.length, steepTris.length, 1)
+  roofGeo.setIndex(tris)
   roofGeo.computeVertexNormals()
-  const roof = new THREE.Mesh(roofGeo, [mats.roof, mats.wallPlain])
+  const roof = new THREE.Mesh(roofGeo, mats.roof)
   roof.castShadow = true
   roof.receiveShadow = true
   group.add(roof)
