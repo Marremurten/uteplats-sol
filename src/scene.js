@@ -54,23 +54,40 @@ export function createScene(canvas, data) {
   // --- Terräng ---
   const terrainMesh = makeTerrain(data.terrain)
   scene.add(terrainMesh)
+  // I DSM-läget innehåller ytan husen — låt den kasta skuggor på sig själv.
+  if (data.terrain.mode === 'dsm') terrainMesh.castShadow = true
+
+  // Skuggvärlden för raycast: hus med laserhöjder, ingen vegetation.
+  // Osynlig — visuellt visas fulla DSM:en (med träd).
+  let occluderMesh = null
+  if (data.terrain.occluderGrid) {
+    occluderMesh = makeGridMesh(
+      data.terrain, data.terrain.occluderGrid, new THREE.MeshBasicMaterial()
+    )
+    occluderMesh.visible = false
+    scene.add(occluderMesh)
+  }
 
   // --- Vägar (kosmetik, ingår inte i skuggberäkningen) ---
   if (data.roads?.length) scene.add(makeRoads(data.roads, data.terrain))
 
-  // --- Byggnader ---
+  // --- Byggnader (extruderade OSM-hus — ej i DSM-läget, där ytmodellen
+  // redan innehåller husen) ---
   const buildingsGroup = new THREE.Group()
-  const buildingMat = new THREE.MeshStandardMaterial({
-    color: 0xc9b8a3, roughness: 0.9,
-  })
-  for (const b of data.buildings) {
-    const mesh = makeBuilding(b, data.terrain, buildingMat)
-    if (mesh) buildingsGroup.add(mesh)
+  if (data.terrain.mode !== 'dsm') {
+    const buildingMat = new THREE.MeshStandardMaterial({
+      color: 0xc9b8a3, roughness: 0.9,
+    })
+    for (const b of data.buildings) {
+      const mesh = makeBuilding(b, data.terrain, buildingMat)
+      if (mesh) buildingsGroup.add(mesh)
+    }
   }
   scene.add(buildingsGroup)
 
-  // --- Uteplatsmarkören ---
-  const groundY = data.terrain.sample(0, 0)
+  // --- Uteplatsmarkören (på marknivå, även om DSM:en skulle ha fångat
+  // ett parasoll eller en trädkrona över punkten) ---
+  const groundY = data.terrain.sampleGround(0, 0)
   const eyeHeight = 1.2
   const samplePoint = new THREE.Vector3(0, groundY + eyeHeight, 0)
 
@@ -102,7 +119,7 @@ export function createScene(canvas, data) {
   // oroterad/oplacerad geometri.
   scene.updateMatrixWorld(true)
 
-  const occluders = [terrainMesh, buildingsGroup]
+  const occluders = [occluderMesh ?? terrainMesh, buildingsGroup]
 
   function setSun(sun) {
     const up = Math.max(sun.altitude, 0)
@@ -154,12 +171,35 @@ export function createScene(canvas, data) {
 const WATER_LEVEL = 1.2
 const COLOR_GROUND = new THREE.Color(0x8a9a7b)
 const COLOR_WATER = new THREE.Color(0x3e6f9e)
+// Cellklasser från pipelinen: 0 mark, 1 vatten, 2 byggnad, 3 vegetation
+const CLASS_COLORS = [
+  COLOR_GROUND,
+  COLOR_WATER,
+  new THREE.Color(0xc9b8a3),
+  new THREE.Color(0x5e7d52),
+]
+
+// Höjdgrid → roterat mesh i markplanet, med BVH för snabba raycasts.
+function makeGridMesh(terrain, grid, material) {
+  const seg = terrain.gridSize - 1
+  const geo = new THREE.PlaneGeometry(
+    terrain.areaSize, terrain.areaSize, seg, seg
+  )
+  const pos = geo.attributes.position
+  const z0 = terrain.originElevation
+  for (let i = 0; i < pos.count; i++) pos.setZ(i, grid[i] - z0)
+  geo.computeVertexNormals()
+  geo.computeBoundsTree()
+  const mesh = new THREE.Mesh(geo, material)
+  mesh.rotation.x = -Math.PI / 2 // XY-plan → XZ-plan, +y → −z (norr)
+  return mesh
+}
 
 function makeTerrain(terrain) {
   const size = terrain.areaSize
   let geo
   let material
-  if (terrain.mode === 'dtm') {
+  if (terrain.mode === 'dtm' || terrain.mode === 'dsm') {
     const seg = terrain.gridSize - 1
     geo = new THREE.PlaneGeometry(size, size, seg, seg)
     const pos = geo.attributes.position
@@ -169,7 +209,11 @@ function makeTerrain(terrain) {
     for (let i = 0; i < pos.count; i++) {
       const elev = terrain.grid[i]
       pos.setZ(i, elev - z0)
-      const c = elev < WATER_LEVEL ? COLOR_WATER : COLOR_GROUND
+      const c = terrain.classGrid
+        ? CLASS_COLORS[terrain.classGrid[i]] ?? COLOR_GROUND
+        : elev < WATER_LEVEL
+          ? COLOR_WATER
+          : COLOR_GROUND
       colors[i * 3] = c.r
       colors[i * 3 + 1] = c.g
       colors[i * 3 + 2] = c.b
@@ -210,10 +254,10 @@ function makeRoads(roads, terrain) {
       // perpendikulär i markplanet
       const px = (-dn / len) * hw
       const pn = (dx / len) * hw
-      const y00 = terrain.sample(e0 + px, n0 + pn) + lift
-      const y01 = terrain.sample(e0 - px, n0 - pn) + lift
-      const y10 = terrain.sample(e1 + px, n1 + pn) + lift
-      const y11 = terrain.sample(e1 - px, n1 - pn) + lift
+      const y00 = terrain.sampleGround(e0 + px, n0 + pn) + lift
+      const y01 = terrain.sampleGround(e0 - px, n0 - pn) + lift
+      const y10 = terrain.sampleGround(e1 + px, n1 + pn) + lift
+      const y11 = terrain.sampleGround(e1 - px, n1 - pn) + lift
       // två trianglar per segment; (e, n) → (x: e, y: höjd, z: −n).
       // Moturs sett uppifrån (+y) så att normalerna pekar upp.
       positions.push(
@@ -229,7 +273,7 @@ function makeRoads(roads, terrain) {
   for (const road of roads) {
     const hw = road.width / 2
     for (const [e, n] of road.path) {
-      const yc = terrain.sample(e, n) + lift
+      const yc = terrain.sampleGround(e, n) + lift
       for (let s = 0; s < SIDES; s++) {
         const a0 = (s / SIDES) * Math.PI * 2
         const a1 = ((s + 1) / SIDES) * Math.PI * 2

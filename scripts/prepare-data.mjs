@@ -12,7 +12,9 @@
  *            "Markhöjdmodell Nedladdning"). Annars platt mark med
  *            konfigurerbart gårdsdjup (site.config.json: courtyardDepth).
  */
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import {
+  readFileSync, writeFileSync, mkdirSync, existsSync, statSync,
+} from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { makeLocalFrame } from '../src/coords.js'
@@ -308,10 +310,218 @@ out tags geom;`
   console.log(`${roads.length} vägsegment.`)
 }
 
-// Välj steg: --buildings / --terrain / --roads (inga flaggor = alla)
+/**
+ * DSM från Lantmäteriets laserpunktmoln (COPC). Range-läser bara de delar
+ * av filen som täcker området, rastrerar högsta retur per 1 m-cell och
+ * klassar varje cell (mark/vatten/byggnad/vegetation) med OSM-fotavtrycken
+ * som byggnadsmask. Kräver att --terrain och --buildings körts först.
+ */
+async function buildDsm() {
+  const envLocal = readEnvLocal()
+  const user = process.env.GEOTORGET_USER ?? envLocal.GEOTORGET_USER
+  const pass = process.env.GEOTORGET_PASS ?? envLocal.GEOTORGET_PASS
+  if (!user || !pass)
+    throw new Error('DSM kräver Geotorget-inloggning (.env.local).')
+  const auth = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
+
+  // DTM som golv/hålfyllnad + byggnadsmask från OSM
+  // Läs alltid DTM-filen direkt (terrain.json kan redan peka på dsm.bin
+  // efter en tidigare --dsm-körning).
+  if (!existsSync(join(outDir, 'terrain.bin')))
+    throw new Error('Kör --terrain (DTM) före --dsm.')
+  const dtm = new Float32Array(
+    readFileSync(join(outDir, 'terrain.bin')).buffer
+  )
+  const footprints = JSON.parse(
+    readFileSync(join(outDir, 'buildings.json'), 'utf8')
+  ).buildings.map((b) => b.footprint)
+
+  const size = cfg.areaSize + 1
+  const dsm = new Float32Array(size * size).fill(NaN)
+  const topClass = new Uint8Array(size * size) // LAS-klass för högsta retur
+
+  console.log('Söker COPC-punktmoln i STAC...')
+  const cornersWgs = [
+    [-half, -half], [half, -half], [half, half], [-half, half], [-half, -half],
+  ].map(([de, dn]) => [
+    cfg.lon + de / (111320 * Math.cos((cfg.lat * Math.PI) / 180)),
+    cfg.lat + dn / 111320,
+  ])
+  const search = await fetch('https://api.lantmateriet.se/stac-hojd/v1/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      collections: ['dsm-skoglig-copc'],
+      intersects: { type: 'Polygon', coordinates: [cornersWgs] },
+      limit: 10,
+    }),
+  })
+  if (!search.ok) throw new Error(`STAC-sökning: HTTP ${search.status}`)
+  const items = (await search.json()).features
+  if (!items.length) throw new Error('Inget COPC-punktmoln täcker området.')
+  console.log(`${items.length} COPC-fil(er): ${items.map((i) => i.id).join(', ')}`)
+
+  const { Copc } = await import('copc')
+  const minE = frame.origin.e - half
+  const maxE = frame.origin.e + half
+  const minN = frame.origin.n - half
+  const maxN = frame.origin.n + half
+
+  for (const item of items) {
+    const url = item.assets.data.href
+    // Servern rate-limitar range-anrop (sporadiska 403). Ladda i stället ner
+    // hela kakelfilen en gång till en lokal cache och läs den därifrån.
+    const cacheDir = join(root, '.cache')
+    mkdirSync(cacheDir, { recursive: true })
+    const cachePath = join(cacheDir, `${item.id}.copc.laz`)
+    if (!existsSync(cachePath)) {
+      console.log(`Laddar ner ${item.id} (hel fil, cachas i .cache/)...`)
+      let res
+      for (let attempt = 1; ; attempt++) {
+        res = await fetch(url, { headers: { Authorization: auth } })
+        if (res.ok) break
+        if (attempt >= 6)
+          throw new Error(`Nedladdning ${item.id}: HTTP ${res.status}`)
+        await new Promise((r) => setTimeout(r, 3000 * attempt))
+      }
+      writeFileSync(cachePath, Buffer.from(await res.arrayBuffer()))
+      console.log(
+        `Klar: ${(statSync(cachePath).size / 1e6).toFixed(0)} MB.`
+      )
+    } else {
+      console.log(`Använder cachad ${item.id} (.cache/).`)
+    }
+
+    const copc = await Copc.create(cachePath)
+    let pointsUsed = 0
+
+    // Läs ALLA noder och filtrera per punkt — nyckel-voxlarnas geometri
+    // visade sig opålitlig att resonera om, och filen är ändå lokal.
+    async function walk(pageRef) {
+      const { nodes, pages } = await Copc.loadHierarchyPage(cachePath, pageRef)
+      const entries = Object.entries(nodes)
+      let done = 0
+      for (const [, node] of entries) {
+        if (!node || !node.pointCount) continue
+        const view = await Copc.loadPointDataView(cachePath, copc, node)
+        const getX = view.getter('X')
+        const getY = view.getter('Y')
+        const getZ = view.getter('Z')
+        const getC = view.getter('Classification')
+        for (let i = 0; i < view.pointCount; i++) {
+          const e = getX(i)
+          const n = getY(i)
+          if (e < minE || e > maxE || n < minN || n > maxN) continue
+          const cls = getC(i)
+          if (cls === 7 || cls === 18) continue // brus
+          const col = Math.round(e - minE)
+          const row = Math.round(maxN - n)
+          const idx = row * size + col
+          const z = getZ(i)
+          if (Number.isNaN(dsm[idx]) || z > dsm[idx]) {
+            dsm[idx] = z
+            topClass[idx] = cls
+          }
+          pointsUsed++
+        }
+        if (++done % 500 === 0)
+          console.log(`  ${done}/${entries.length} noder lästa...`)
+      }
+      for (const [, page] of Object.entries(pages)) {
+        if (page) await walk(page)
+      }
+    }
+    await walk(copc.info.rootHierarchyPage)
+    console.log(`${item.id}: ${pointsUsed} punkter i området.`)
+  }
+
+  // Hål → DTM; och DSM aldrig under DTM (gles laser vid blanka ytor).
+  let holes = 0
+  for (let i = 0; i < dsm.length; i++) {
+    if (Number.isNaN(dsm[i])) {
+      dsm[i] = dtm[i]
+      holes++
+    } else if (dsm[i] < dtm[i]) dsm[i] = dtm[i]
+  }
+  if (holes) console.log(`${holes} celler utan laserpunkter fylldes från DTM.`)
+
+  // Cellklassning för färgsättning: 0 mark, 1 vatten, 2 byggnad, 3 vegetation
+  const cellClass = new Uint8Array(size * size)
+  const boxes = footprints.map((fp) => {
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+    for (const [e, n] of fp) {
+      x0 = Math.min(x0, e); x1 = Math.max(x1, e)
+      y0 = Math.min(y0, n); y1 = Math.max(y1, n)
+    }
+    return [x0, x1, y0, y1]
+  })
+  const inPoly = (e, n, fp) => {
+    let inside = false
+    for (let i = 0, j = fp.length - 1; i < fp.length; j = i++) {
+      const [xi, yi] = fp[i]
+      const [xj, yj] = fp[j]
+      if (yi > n !== yj > n && e < ((xj - xi) * (n - yi)) / (yj - yi) + xi)
+        inside = !inside
+    }
+    return inside
+  }
+  for (let row = 0; row < size; row++) {
+    const n = half - row
+    for (let col = 0; col < size; col++) {
+      const e = col - half
+      const idx = row * size + col
+      const dz = dsm[idx] - dtm[idx]
+      if (topClass[idx] === 9 || dsm[idx] < 1.2) cellClass[idx] = 1
+      else if (dz > 2.0) {
+        let inBuilding = false
+        for (let b = 0; b < footprints.length; b++) {
+          const [x0, x1, y0, y1] = boxes[b]
+          if (e < x0 || e > x1 || n < y0 || n > y1) continue
+          if (inPoly(e, n, footprints[b])) { inBuilding = true; break }
+        }
+        cellClass[idx] = inBuilding ? 2 : 3
+      }
+    }
+  }
+
+  // Skuggvärlden ("occluder"): laserhöjd där OSM-fotavtryck finns (= husens
+  // verkliga uppmätta höjder), marknivå i övrigt. Vegetation skuggar alltså
+  // inte — användarens facit är observerat genom/förbi träden, och lövverk
+  // är varken massivt eller åretruntgrönt.
+  const occluder = new Float32Array(size * size)
+  for (let i = 0; i < occluder.length; i++) {
+    occluder[i] = cellClass[i] === 2 ? Math.max(dsm[i], dtm[i]) : dtm[i]
+  }
+
+  const center = Math.round(half) * size + Math.round(half)
+  writeFileSync(join(outDir, 'dsm.bin'), Buffer.from(dsm.buffer))
+  writeFileSync(join(outDir, 'dsm_occluder.bin'), Buffer.from(occluder.buffer))
+  writeFileSync(join(outDir, 'dsm_class.bin'), Buffer.from(cellClass.buffer))
+  writeFileSync(
+    join(outDir, 'terrain.json'),
+    JSON.stringify({
+      mode: 'dsm',
+      attribution: 'Laserdata ytmodell © Lantmäteriet (CC BY 4.0)',
+      areaSize: cfg.areaSize,
+      gridSize: size,
+      originElevation: dtm[center], // markens nivå vid uteplatsen
+      file: 'dsm.bin',
+      occluderFile: 'dsm_occluder.bin',
+      classFile: 'dsm_class.bin',
+      groundFile: 'terrain.bin',
+    })
+  )
+  console.log(
+    `DSM klar (${size}×${size} @ 1 m). Uteplatsens mark ${dtm[center].toFixed(1)} möh, ` +
+      `DSM där: ${dsm[center].toFixed(1)} möh.`
+  )
+}
+
+// Välj steg: --buildings / --terrain / --roads / --dsm (inga flaggor = alla)
 const args = process.argv.slice(2)
 const all = args.length === 0
 if (all || args.includes('--buildings')) await buildBuildings()
 if (all || args.includes('--terrain')) await buildTerrain()
 if (all || args.includes('--roads')) await buildRoads()
+if (args.includes('--dsm')) await buildDsm() // opt-in: kräver DTM + byggnader
 console.log('Klart. Data i public/data/')

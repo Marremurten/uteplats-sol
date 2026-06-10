@@ -15,40 +15,61 @@ export async function loadData() {
   ])
 
   let terrain
-  if (terrainMeta.mode === 'dtm') {
-    const buf = await fetch(`data/${terrainMeta.file}`).then((r) => {
-      if (!r.ok) throw new Error(`Kunde inte läsa ${terrainMeta.file}`)
-      return r.arrayBuffer()
-    })
-    const grid = new Float32Array(buf)
+  if (terrainMeta.mode === 'dtm' || terrainMeta.mode === 'dsm') {
+    const loadGrid = (name) =>
+      fetch(`data/${name}`).then((r) => {
+        if (!r.ok) throw new Error(`Kunde inte läsa ${name}`)
+        return r.arrayBuffer()
+      })
+    const grid = new Float32Array(await loadGrid(terrainMeta.file))
+    // I DSM-läget: separat markgrid (för markör/vägar) och cellklasser
+    // (för färgsättning av ytan).
+    const groundGrid = terrainMeta.groundFile
+      ? new Float32Array(await loadGrid(terrainMeta.groundFile))
+      : null
+    const classGrid = terrainMeta.classFile
+      ? new Uint8Array(await loadGrid(terrainMeta.classFile))
+      : null
+    // Skuggvärlden: hus med laserhöjder, utan vegetation (se pipelinen).
+    const occluderGrid = terrainMeta.occluderFile
+      ? new Float32Array(await loadGrid(terrainMeta.occluderFile))
+      : null
     const size = terrainMeta.gridSize
     const half = terrainMeta.areaSize / 2
     const z0 = terrainMeta.originElevation
+
+    // Bilinjär sampling; (e, n) i lokala meter → höjd relativt uteplatsen.
+    const makeSampler = (g) => (e, n) => {
+      const col = Math.min(Math.max(e + half, 0), terrainMeta.areaSize)
+      const row = Math.min(Math.max(half - n, 0), terrainMeta.areaSize)
+      const c0 = Math.floor(col)
+      const r0 = Math.floor(row)
+      const c1 = Math.min(c0 + 1, size - 1)
+      const r1 = Math.min(r0 + 1, size - 1)
+      const fc = col - c0
+      const fr = row - r0
+      return (
+        g[r0 * size + c0] * (1 - fc) * (1 - fr) +
+        g[r0 * size + c1] * fc * (1 - fr) +
+        g[r1 * size + c0] * (1 - fc) * fr +
+        g[r1 * size + c1] * fc * fr -
+        z0
+      )
+    }
+
     terrain = {
-      mode: 'dtm',
+      mode: terrainMeta.mode,
       areaSize: terrainMeta.areaSize,
       gridSize: size,
       grid,
+      classGrid,
+      occluderGrid,
       originElevation: z0,
       attribution: terrainMeta.attribution,
-      // Bilinjär sampling; (e, n) i lokala meter → höjd relativt uteplatsen.
-      sample(e, n) {
-        const col = Math.min(Math.max(e + half, 0), terrainMeta.areaSize)
-        const row = Math.min(Math.max(half - n, 0), terrainMeta.areaSize)
-        const c0 = Math.floor(col)
-        const r0 = Math.floor(row)
-        const c1 = Math.min(c0 + 1, size - 1)
-        const r1 = Math.min(r0 + 1, size - 1)
-        const fc = col - c0
-        const fr = row - r0
-        const v =
-          grid[r0 * size + c0] * (1 - fc) * (1 - fr) +
-          grid[r0 * size + c1] * fc * (1 - fr) +
-          grid[r1 * size + c0] * (1 - fc) * fr +
-          grid[r1 * size + c1] * fc * fr
-        return v - z0
-      },
-      // I DTM-läget ingår nedsänkningen i terrängen.
+      sample: makeSampler(grid),
+      // Markens nivå (utan hus/träd) — för markör och vägar i DSM-läget.
+      sampleGround: groundGrid ? makeSampler(groundGrid) : makeSampler(grid),
+      // I grid-lägena ingår nedsänkningen i terrängen.
       buildingExtra: 0,
     }
   } else {
@@ -58,6 +79,7 @@ export async function loadData() {
       areaSize: terrainMeta.areaSize,
       courtyardDepth: depth,
       sample: () => 0,
+      sampleGround: () => 0,
       // Platt mark = gårdens golvnivå. Husens OSM-höjder utgår från
       // gatunivån, som ligger `depth` meter högre — silhuetten från gården
       // blir rätt om husen förlängs med gårdsdjupet.

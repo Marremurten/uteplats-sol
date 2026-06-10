@@ -57,7 +57,14 @@ export function setupUI({ lat, lon, onChange, getWindows }) {
       windowsCache = getWindows(date)
       el.windows.replaceChildren()
       if (windowsCache.length) {
-        el.windows.append('Sol på uteplatsen: ')
+        const total = windowsCache.reduce(
+          (sum, w) => sum + (w.end - w.start) / 60000, 0
+        )
+        const h = Math.floor(total / 60)
+        const m = Math.round(total % 60)
+        el.windows.append(
+          `Sol på uteplatsen ${h ? `${h} h ` : ''}${m ? `${m} min` : ''}: `
+        )
         windowsCache.forEach((w, i) => {
           if (i > 0) el.windows.append(', ')
           const b = document.createElement('b')
