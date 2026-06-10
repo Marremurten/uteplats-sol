@@ -34,6 +34,13 @@ export async function loadData() {
     const occluderGrid = terrainMeta.occluderFile
       ? new Float32Array(await loadGrid(terrainMeta.occluderFile))
       : null
+    // Full ytmodell inkl. vegetation — trädhöjder för visualiseringen.
+    // I dsm-läget är huvudgriden redan den fulla ytmodellen.
+    const canopyGrid = terrainMeta.dsmFile
+      ? new Float32Array(await loadGrid(terrainMeta.dsmFile))
+      : terrainMeta.mode === 'dsm'
+        ? grid
+        : null
     const size = terrainMeta.gridSize
     const half = terrainMeta.areaSize / 2
     const z0 = terrainMeta.originElevation
@@ -62,6 +69,9 @@ export async function loadData() {
       areaSize: terrainMeta.areaSize,
       gridSize: size,
       grid,
+      // I dtm-läget är huvudgriden marken; i dsm-läget är marken separat.
+      groundGrid: groundGrid ?? (terrainMeta.mode === 'dtm' ? grid : null),
+      canopyGrid,
       classGrid,
       occluderGrid,
       originElevation: z0,

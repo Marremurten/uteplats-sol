@@ -548,6 +548,8 @@ async function buildDsm() {
       file: 'terrain.bin',
       occluderFile: 'dsm_occluder.bin',
       classFile: 'dsm_class.bin',
+      // Full ytmodell (inkl. vegetation) — trädhöjder för visualiseringen.
+      dsmFile: 'dsm.bin',
     })
   )
   console.log(
