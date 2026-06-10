@@ -78,8 +78,15 @@ export function createScene(canvas, data) {
     const buildingMat = new THREE.MeshStandardMaterial({
       color: 0xc9b8a3, roughness: 0.9,
     })
+    const roofMat = new THREE.MeshStandardMaterial({
+      color: 0x9c5e4a, roughness: 0.85,
+    })
     for (const b of data.buildings) {
-      const mesh = makeBuilding(b, data.terrain, buildingMat)
+      // Med laserdata: skarpa väggar till takfoten + laserformat tak
+      // (nockar, valmningar). Annars: platt låda.
+      const mesh = data.terrain.sampleOccluder
+        ? makeLaserBuilding(b, data.terrain, buildingMat, roofMat)
+        : makeBuilding(b, data.terrain, buildingMat)
       if (mesh) buildingsGroup.add(mesh)
     }
   }
@@ -301,6 +308,136 @@ function makeRoads(roads, terrain) {
   )
   mesh.receiveShadow = true
   return mesh
+}
+
+function pointInPolygon(e, n, fp) {
+  let inside = false
+  for (let i = 0, j = fp.length - 1; i < fp.length; j = i++) {
+    const [xi, yi] = fp[i]
+    const [xj, yj] = fp[j]
+    if (yi > n !== yj > n && e < ((xj - xi) * (n - yi)) / (yj - yi) + xi)
+      inside = !inside
+  }
+  return inside
+}
+
+/**
+ * Hus med skarpa väggar och laserformat tak: väggarna extruderas från
+ * lägsta markpunkten till takfoten (15:e percentilen av laserytan inom
+ * fotavtrycket), och taket är ett 1 m-grid av laserytan, klippt mot
+ * fotavtrycket och nedvikt till takfoten i kanterna.
+ */
+function makeLaserBuilding(b, terrain, wallMat, roofMat) {
+  const ring = b.footprint
+  if (ring.length < 4) return null
+
+  let baseY = Infinity
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+  for (const [e, n] of ring) {
+    baseY = Math.min(baseY, terrain.sampleGround(e, n))
+    x0 = Math.min(x0, e); x1 = Math.max(x1, e)
+    y0 = Math.min(y0, n); y1 = Math.max(y1, n)
+  }
+
+  // Laserytan i husets celler → takfot (p15) och fallback-höjd
+  const heights = []
+  const inside = new Map()
+  for (let n = Math.floor(y0); n <= Math.ceil(y1); n++) {
+    for (let e = Math.floor(x0); e <= Math.ceil(x1); e++) {
+      if (pointInPolygon(e, n, ring)) {
+        const h = terrain.sampleOccluder(e, n)
+        inside.set(`${e},${n}`, h)
+        heights.push(h)
+      }
+    }
+  }
+  if (heights.length < 6) return makeBuilding(b, terrain, wallMat)
+
+  // 3×3-medianfilter på takytan: tar bort skorstenar/antenner (punktspikar)
+  // men bevarar nockar, som har stöd längs hela sin längd.
+  const smoothed = new Map()
+  for (const key of inside.keys()) {
+    const [e, n] = key.split(',').map(Number)
+    const neigh = []
+    for (let dn = -1; dn <= 1; dn++) {
+      for (let de = -1; de <= 1; de++) {
+        const v = inside.get(`${e + de},${n + dn}`)
+        if (v !== undefined) neigh.push(v)
+      }
+    }
+    neigh.sort((a, c) => a - c)
+    smoothed.set(key, neigh[Math.floor(neigh.length / 2)])
+  }
+  for (const [key, v] of smoothed) inside.set(key, v)
+
+  heights.sort((a, c) => a - c)
+  const eaveY = Math.max(
+    heights[Math.floor(heights.length * 0.15)],
+    baseY + 3 // aldrig lägre väggar än ~en våning
+  )
+
+  const group = new THREE.Group()
+
+  // Väggar: extrudering bas → takfot
+  const shape = new THREE.Shape()
+  shape.moveTo(ring[0][0], ring[0][1])
+  for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i][0], ring[i][1])
+  shape.closePath()
+  const wallGeo = new THREE.ExtrudeGeometry(shape, {
+    depth: eaveY - baseY,
+    bevelEnabled: false,
+  })
+  const walls = new THREE.Mesh(wallGeo, wallMat)
+  walls.rotation.x = -Math.PI / 2
+  walls.position.y = baseY
+  walls.castShadow = true
+  walls.receiveShadow = true
+  group.add(walls)
+
+  // Tak: grid över bbox; utanför fotavtrycket viks ytan ner till takfoten,
+  // trianglar helt utanför klipps bort.
+  const cols = Math.ceil(x1) - Math.floor(x0) + 1
+  const rows = Math.ceil(y1) - Math.floor(y0) + 1
+  const verts = []
+  const tris = []
+  const heightAt = (e, n) => {
+    const h = inside.get(`${e},${n}`)
+    return h === undefined ? eaveY : Math.max(h, eaveY)
+  }
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const e = Math.floor(x0) + c
+      const n = Math.floor(y0) + r
+      verts.push(e, heightAt(e, n), -n)
+    }
+  }
+  const isIn = (r, c) =>
+    inside.has(`${Math.floor(x0) + c},${Math.floor(y0) + r}`)
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
+      const a = r * cols + c
+      const bb = a + 1
+      const cc = a + cols
+      const dd = cc + 1
+      // hoppa över rutor som helt saknar kontakt med huset
+      if (!isIn(r, c) && !isIn(r, c + 1) && !isIn(r + 1, c) && !isIn(r + 1, c + 1))
+        continue
+      tris.push(a, bb, cc, bb, dd, cc)
+    }
+  }
+  const roofGeo = new THREE.BufferGeometry()
+  roofGeo.setAttribute(
+    'position', new THREE.BufferAttribute(new Float32Array(verts), 3)
+  )
+  roofGeo.setIndex(tris)
+  roofGeo.computeVertexNormals()
+  const roof = new THREE.Mesh(roofGeo, roofMat)
+  roof.castShadow = true
+  roof.receiveShadow = true
+  group.add(roof)
+
+  group.userData.id = b.id
+  return group
 }
 
 function makeBuilding(b, terrain, material) {

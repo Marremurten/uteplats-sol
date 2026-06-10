@@ -69,6 +69,9 @@ export async function loadData() {
       sample: makeSampler(grid),
       // Markens nivå (utan hus/träd) — för markör och vägar i DSM-läget.
       sampleGround: groundGrid ? makeSampler(groundGrid) : makeSampler(grid),
+      // Laserytan inom husfotavtryck (skuggvärlden) — används även för
+      // takformerna i visualiseringen.
+      sampleOccluder: occluderGrid ? makeSampler(occluderGrid) : null,
       // I grid-lägena ingår nedsänkningen i terrängen.
       buildingExtra: 0,
     }
